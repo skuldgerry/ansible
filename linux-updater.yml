@@ -3,7 +3,7 @@
   hosts: all
   become: yes
   tasks:
-    - name: Update package manager cache
+    - name: Update package manager cache (Debian-based)
       ansible.builtin.apt:
         update_cache: yes
       when: ansible_os_family == "Debian"
@@ -18,3 +18,9 @@
         name: "*"
         state: latest
       when: ansible_os_family == "RedHat"
+
+    - name: Upgrade all packages (Fedora-based)
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+      when: ansible_distribution == "Fedora"
