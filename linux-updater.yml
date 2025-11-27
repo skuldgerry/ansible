@@ -2,47 +2,191 @@
 - name: Update all Linux nodes
   hosts: all
   become: yes
+  gather_facts: yes
   serial: 2  # Process only 2 servers at a time
+  
+  # Connection settings to prevent hanging on unreachable hosts
+  vars:
+    ansible_command_timeout: 30
+    ansible_connect_timeout: 30
+    lock_file_path: /tmp/ansible-updater.lock
+    package_timeout: 3600  # 60 minutes max per package operation
+    cache_timeout: 600     # 10 minutes max for cache updates
+  
+  # Pre-tasks: Lock file mechanism to prevent concurrent execution
+  pre_tasks:
+    - name: Check for existing lock file
+      ansible.builtin.stat:
+        path: "{{ lock_file_path }}"
+      register: lock_file
+      delegate_to: localhost
+      run_once: true
+    
+    - name: Check if lock file is stale (older than 4 hours)
+      ansible.builtin.stat:
+        path: "{{ lock_file_path }}"
+      register: lock_file_stale
+      delegate_to: localhost
+      run_once: true
+      when: lock_file.stat.exists | default(false)
+    
+    - name: Remove stale lock file
+      ansible.builtin.file:
+        path: "{{ lock_file_path }}"
+        state: absent
+      delegate_to: localhost
+      run_once: true
+      when: 
+        - lock_file.stat.exists | default(false)
+        - (ansible_date_time.epoch | int) - (lock_file_stale.stat.mtime | int) > 14400  # 4 hours in seconds
+      failed_when: false
+    
+    - name: Fail if lock file exists (another instance is running)
+      ansible.builtin.fail:
+        msg: "Another update playbook is already running. Lock file exists at {{ lock_file_path }}. If this is stale, remove it manually."
+      when: 
+        - lock_file.stat.exists | default(false)
+        - not ((ansible_date_time.epoch | int) - (lock_file_stale.stat.mtime | int) > 14400)
+      delegate_to: localhost
+      run_once: true
+    
+    - name: Create lock file
+      ansible.builtin.file:
+        path: "{{ lock_file_path }}"
+        state: touch
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+      failed_when: false
+    
+    - name: Set lock file content with timestamp
+      ansible.builtin.copy:
+        content: "Locked by Ansible at {{ ansible_date_time.iso8601 }} - PID: {{ ansible_env.PID | default('unknown') }}"
+        dest: "{{ lock_file_path }}"
+        mode: '0644'
+      delegate_to: localhost
+      run_once: true
+  
   tasks:
+    # Debian-based systems
     - name: Update package manager cache (Debian-based)
-      ansible.builtin.apt:
-        update_cache: yes
+      block:
+        - name: Update apt cache
+          ansible.builtin.apt:
+            update_cache: yes
+            cache_valid_time: 3600
+          async: "{{ cache_timeout }}"
+          poll: 10
+          register: apt_cache_result
+      rescue:
+        - name: Log cache update failure (Debian)
+          ansible.builtin.debug:
+            msg: "Failed to update cache on {{ inventory_hostname }} (timeout or error). Continuing..."
       when: ansible_os_family == "Debian"
-      timeout: 600  # 10 minutes timeout
-      retries: 3    # Retry up to 3 times if it fails
-      delay: 5      # 5-second delay between retries
-      ignore_errors: yes  # Skip if it fails after retries
-
+      ignore_errors: yes
+    
     - name: Upgrade all packages (Debian-based)
-      ansible.builtin.apt:
-        upgrade: dist
+      block:
+        - name: Upgrade packages
+          ansible.builtin.apt:
+            upgrade: dist
+            autoremove: yes
+            autoclean: yes
+          async: "{{ package_timeout }}"
+          poll: 30
+          register: apt_upgrade_result
+      rescue:
+        - name: Log upgrade failure (Debian)
+          ansible.builtin.debug:
+            msg: "Package upgrade failed or timed out on {{ inventory_hostname }} after {{ package_timeout }}s. Check host manually."
       when: ansible_os_family == "Debian"
-      timeout: 3600  # 1 hour timeout
-      retries: 3     # Retry up to 3 times if it fails
-      delay: 5       # 5-second delay between retries
-      ignore_errors: yes  # Skip if it fails after retries
-
-    - name: Upgrade all packages (RHEL-based)
-      ansible.builtin.yum:
-        name: "*"
-        state: latest
+      ignore_errors: yes
+    
+    # RHEL-based systems
+    - name: Update package manager cache (RHEL-based)
+      block:
+        - name: Update yum cache
+          ansible.builtin.yum:
+            update_cache: yes
+          async: "{{ cache_timeout }}"
+          poll: 10
+          register: yum_cache_result
+      rescue:
+        - name: Log cache update failure (RHEL)
+          ansible.builtin.debug:
+            msg: "Failed to update cache on {{ inventory_hostname }} (timeout or error). Continuing..."
       when: ansible_os_family == "RedHat"
-      timeout: 3600  # 1 hour timeout
-      retries: 3     # Retry up to 3 times if it fails
-      delay: 5       # 5-second delay between retries
-      ignore_errors: yes  # Skip if it fails after retries
-
-    - name: Upgrade all packages (Fedora-based)
-      ansible.builtin.dnf:
-        name: "*"
-        state: latest
+      ignore_errors: yes
+    
+    - name: Upgrade all packages (RHEL-based)
+      block:
+        - name: Upgrade packages
+          ansible.builtin.yum:
+            name: "*"
+            state: latest
+          async: "{{ package_timeout }}"
+          poll: 30
+          register: yum_upgrade_result
+      rescue:
+        - name: Log upgrade failure (RHEL)
+          ansible.builtin.debug:
+            msg: "Package upgrade failed or timed out on {{ inventory_hostname }} after {{ package_timeout }}s. Check host manually."
+      when: ansible_os_family == "RedHat"
+      ignore_errors: yes
+    
+    # Fedora-based systems
+    - name: Update package manager cache (Fedora-based)
+      block:
+        - name: Update dnf cache
+          ansible.builtin.dnf:
+            update_cache: yes
+          async: "{{ cache_timeout }}"
+          poll: 10
+          register: dnf_cache_result
+      rescue:
+        - name: Log cache update failure (Fedora)
+          ansible.builtin.debug:
+            msg: "Failed to update cache on {{ inventory_hostname }} (timeout or error). Continuing..."
       when: ansible_distribution == "Fedora"
-      timeout: 3600  # 1 hour timeout
-      retries: 3     # Retry up to 3 times if it fails
-      delay: 5       # 5-second delay between retries
-      ignore_errors: yes  # Skip if it fails after retries
-
-    - name: Pause between batches
-      ansible.builtin.pause:
-        seconds: 30  # 30-second delay before starting the next batch of 2 servers
-      when: ansible_play_batch[-1] == inventory_hostname  # Only run on the last host of the batch
+      ignore_errors: yes
+    
+    - name: Upgrade all packages (Fedora-based)
+      block:
+        - name: Upgrade packages
+          ansible.builtin.dnf:
+            name: "*"
+            state: latest
+          async: "{{ package_timeout }}"
+          poll: 30
+          register: dnf_upgrade_result
+      rescue:
+        - name: Log upgrade failure (Fedora)
+          ansible.builtin.debug:
+            msg: "Package upgrade failed or timed out on {{ inventory_hostname }} after {{ package_timeout }}s. Check host manually."
+      when: ansible_distribution == "Fedora"
+      ignore_errors: yes
+  
+  # Post-tasks: Clean up lock file
+  post_tasks:
+    - name: Remove lock file
+      ansible.builtin.file:
+        path: "{{ lock_file_path }}"
+        state: absent
+      delegate_to: localhost
+      run_once: true
+      failed_when: false
+  
+  # Always cleanup lock file, even on failure
+  rescue:
+    - name: Remove lock file on failure
+      ansible.builtin.file:
+        path: "{{ lock_file_path }}"
+        state: absent
+      delegate_to: localhost
+      run_once: true
+      failed_when: false
+    
+    - name: Display failure message
+      ansible.builtin.debug:
+        msg: "Playbook failed, but lock file has been cleaned up. Check logs for details."
+      run_once: true
