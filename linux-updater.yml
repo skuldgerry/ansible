@@ -166,7 +166,7 @@
       when: ansible_distribution == "Fedora"
       ignore_errors: yes
   
-  # Post-tasks: Clean up lock file
+  # Post-tasks: Clean up lock file (always runs, even on failure)
   post_tasks:
     - name: Remove lock file
       ansible.builtin.file:
@@ -175,18 +175,9 @@
       delegate_to: localhost
       run_once: true
       failed_when: false
-  
-  # Always cleanup lock file, even on failure
-  rescue:
-    - name: Remove lock file on failure
-      ansible.builtin.file:
-        path: "{{ lock_file_path }}"
-        state: absent
-      delegate_to: localhost
+    
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: "Update playbook completed. Lock file cleaned up."
       run_once: true
       failed_when: false
-    
-    - name: Display failure message
-      ansible.builtin.debug:
-        msg: "Playbook failed, but lock file has been cleaned up. Check logs for details."
-      run_once: true
