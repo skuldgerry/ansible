@@ -1,387 +1,333 @@
 ---
+# The lock is acquired in its own play so `serial` does not recreate it for
+# every batch of hosts. A directory is used because mkdir is atomic.
+- name: Acquire Linux updater lock
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  become: false
+  any_errors_fatal: true
+
+  vars:
+    updater_lock_path: /tmp/ansible-updater.lock
+    updater_lock_stale_seconds: 43200  # 12 hours
+
+  tasks:
+    - name: Inspect updater lock
+      ansible.builtin.stat:
+        path: "{{ updater_lock_path }}"
+      register: updater_lock
+
+    - name: Remove a stale updater lock
+      ansible.builtin.file:
+        path: "{{ updater_lock_path }}"
+        state: absent
+      when:
+        - updater_lock.stat.exists | default(false)
+        - >-
+          (ansible_facts["date_time"]["epoch"] | int) -
+          (updater_lock.stat.mtime | int) > updater_lock_stale_seconds
+
+    - name: Stop when another updater run owns the lock
+      ansible.builtin.fail:
+        msg: >-
+          Another Linux updater run is active. Lock path:
+          {{ updater_lock_path }}. It will be considered stale after
+          {{ updater_lock_stale_seconds // 3600 }} hours.
+      when:
+        - updater_lock.stat.exists | default(false)
+        - >-
+          (ansible_facts["date_time"]["epoch"] | int) -
+          (updater_lock.stat.mtime | int) <= updater_lock_stale_seconds
+
+    - name: Atomically acquire updater lock
+      ansible.builtin.command:
+        argv:
+          - mkdir
+          - "{{ updater_lock_path }}"
+      changed_when: true
+
+    - name: Record updater lock owner
+      ansible.builtin.copy:
+        dest: "{{ updater_lock_path }}/owner"
+        mode: "0644"
+        content: |
+          Started: {{ ansible_facts["date_time"]["iso8601"] }}
+          Controller user: {{ lookup("env", "USER") | default("unknown", true) }}
+          Semaphore task: {{ lookup("env", "SEMAPHORE_TASK_ID") | default("unknown", true) }}
+
 - name: Update all Linux nodes
   hosts: all
-  become: yes
-  gather_facts: yes
-  serial: 2  # Process only 2 servers at a time
-  any_errors_fatal: false  # Continue even if some hosts fail
-  max_fail_percentage: 50  # Allow up to 50% of hosts to fail before stopping
-  
-  # Connection settings to prevent hanging on unreachable hosts
+  become: true
+  gather_facts: true
+  serial: 2
+  any_errors_fatal: false
+  # Continue with later batches even if every host in one batch fails.
+  max_fail_percentage: 100
+
   vars:
-    ansible_command_timeout: 30
-    ansible_connect_timeout: 30
-    lock_file_path: /tmp/ansible-updater.lock
-    package_timeout_initial: 300   # 5 minutes for first attempt
-    package_timeout_retry: 1800    # 30 minutes for retry attempt
-    cache_timeout: 600             # 10 minutes max for cache updates
-  
-  # Pre-tasks: Lock file mechanism to prevent concurrent execution
-  pre_tasks:
-    - name: Check for existing lock file
-      ansible.builtin.stat:
-        path: "{{ lock_file_path }}"
-      register: lock_file
-      delegate_to: localhost
-      run_once: true
-      become: false  # Don't require sudo for localhost operations
-    
-    - name: Check if lock file is stale (older than 4 hours)
-      ansible.builtin.stat:
-        path: "{{ lock_file_path }}"
-      register: lock_file_stale
-      delegate_to: localhost
-      run_once: true
-      become: false
-      when: lock_file.stat.exists | default(false)
-    
-    - name: Remove stale lock file
-      ansible.builtin.file:
-        path: "{{ lock_file_path }}"
-        state: absent
-      delegate_to: localhost
-      run_once: true
-      become: false
-      when: 
-        - lock_file.stat.exists | default(false)
-        - (ansible_date_time.epoch | int) - (lock_file_stale.stat.mtime | int) > 14400  # 4 hours in seconds
-      failed_when: false
-    
-    - name: Fail if lock file exists (another instance is running)
-      ansible.builtin.fail:
-        msg: "Another update playbook is already running. Lock file exists at {{ lock_file_path }}. If this is stale, remove it manually."
-      when: 
-        - lock_file.stat.exists | default(false)
-        - not ((ansible_date_time.epoch | int) - (lock_file_stale.stat.mtime | int) > 14400)
-      delegate_to: localhost
-      run_once: true
-      become: false
-    
-    - name: Create lock file
-      ansible.builtin.file:
-        path: "{{ lock_file_path }}"
-        state: touch
-        mode: '0644'
-      delegate_to: localhost
-      run_once: true
-      become: false
-      failed_when: false
-    
-    - name: Set lock file content with timestamp
-      ansible.builtin.copy:
-        content: "Locked by Ansible at {{ ansible_date_time.iso8601 }} - PID: {{ ansible_env.PID | default('unknown') }}"
-        dest: "{{ lock_file_path }}"
-        mode: '0644'
-      delegate_to: localhost
-      run_once: true
-      become: false
-    
-    - name: Initialize upgrade status tracking
-      ansible.builtin.set_fact:
-        upgrade_status: "pending"
-      failed_when: false
-  
+    # This is the SSH connection/socket timeout, not the package task timeout.
+    ansible_ssh_timeout: 30
+
+    cache_timeout: 600              # 10 minutes
+    repair_timeout: 900             # 15 minutes
+    upgrade_timeout: 2700           # 45 minutes
+    cleanup_timeout: 600            # 10 minutes
+    timeout_kill_grace: 60          # SIGKILL 60 seconds after SIGTERM
+    async_watchdog_margin: 120       # Independent Ansible-side margin
+    async_poll_interval: 10
+
+    apt_lock_timeout: 180
+    apt_download_timeout: 30
+    apt_download_retries: 3
+    apt_environment:
+      DEBIAN_FRONTEND: noninteractive
+      DEBIAN_PRIORITY: critical
+      APT_LISTCHANGES_FRONTEND: none
+      NEEDRESTART_MODE: a
+      UCF_FORCE_CONFFOLD: "1"
+      LC_ALL: C
+
+    rpm_package_manager: >-
+      {{ ansible_facts["pkg_mgr"]
+         if (ansible_facts["pkg_mgr"] | default(""))
+            in ["dnf", "dnf5", "yum"]
+         else "dnf" }}
+    rpm_upgrade_action: >-
+      {{ "update" if rpm_package_manager == "yum" else "upgrade" }}
+
   tasks:
-    # ============================================
-    # PHASE 1: Initial attempt with 5-minute timeout
-    # ============================================
-    
-    # Debian-based systems - Phase 1
-    - name: Update package manager cache (Debian-based) - Phase 1
-      block:
-        - name: Update apt cache with timeout
-          ansible.builtin.shell: |
-            timeout {{ cache_timeout }} apt-get update
-          args:
-            executable: /bin/bash
-          register: apt_cache_result
-          failed_when: false
-      rescue:
-        - name: Log cache update failure (Debian)
-          ansible.builtin.debug:
-            msg: "Failed to update cache on {{ inventory_hostname }}. Continuing..."
-      when: ansible_os_family == "Debian"
-      ignore_errors: yes
-    
-    - name: Upgrade packages (Debian-based) - Phase 1 - Initial 5min attempt
-      block:
-        - name: Upgrade packages with 5-minute timeout
-          ansible.builtin.shell: |
-            timeout {{ package_timeout_initial }} apt-get upgrade -y -o Dpkg::Options::="--force-confold" && \
-            apt-get autoremove -y && \
-            apt-get autoclean -y
-          args:
-            executable: /bin/bash
-          register: apt_upgrade_phase1
-          failed_when: false
-        
-        - name: Check if Phase 1 upgrade succeeded
-          ansible.builtin.set_fact:
-            upgrade_status: "{{ 'success' if apt_upgrade_phase1.rc == 0 else 'timeout' }}"
-          when: apt_upgrade_phase1.rc is defined
-        
-        - name: Log Phase 1 success (Debian)
-          ansible.builtin.debug:
-            msg: "Package upgrade completed successfully on {{ inventory_hostname }} in Phase 1"
-          when: upgrade_status == "success"
-        
-        - name: Log Phase 1 timeout (Debian)
-          ansible.builtin.debug:
-            msg: "Package upgrade timed out on {{ inventory_hostname }} in Phase 1 (5 min). Will retry in Phase 2."
-          when: upgrade_status == "timeout"
-      rescue:
-        - name: Mark as timeout on error (Debian)
-          ansible.builtin.set_fact:
-            upgrade_status: "timeout"
-        - name: Log Phase 1 error (Debian)
-          ansible.builtin.debug:
-            msg: "Package upgrade error on {{ inventory_hostname }} in Phase 1. Will retry in Phase 2."
-      when: ansible_os_family == "Debian"
-      ignore_errors: yes
-    
-    # RHEL-based systems - Phase 1
-    - name: Update package manager cache (RHEL-based) - Phase 1
-      block:
-        - name: Update yum cache with timeout
-          ansible.builtin.shell: |
-            timeout {{ cache_timeout }} yum makecache
-          args:
-            executable: /bin/bash
-          register: yum_cache_result
-          failed_when: false
-      rescue:
-        - name: Log cache update failure (RHEL)
-          ansible.builtin.debug:
-            msg: "Failed to update cache on {{ inventory_hostname }}. Continuing..."
-      when: ansible_os_family == "RedHat"
-      ignore_errors: yes
-    
-    - name: Upgrade packages (RHEL-based) - Phase 1 - Initial 5min attempt
-      block:
-        - name: Upgrade packages with 5-minute timeout
-          ansible.builtin.shell: |
-            timeout {{ package_timeout_initial }} yum update -y
-          args:
-            executable: /bin/bash
-          register: yum_upgrade_phase1
-          failed_when: false
-        
-        - name: Check if Phase 1 upgrade succeeded
-          ansible.builtin.set_fact:
-            upgrade_status: "{{ 'success' if yum_upgrade_phase1.rc == 0 else 'timeout' }}"
-          when: yum_upgrade_phase1.rc is defined
-        
-        - name: Log Phase 1 success (RHEL)
-          ansible.builtin.debug:
-            msg: "Package upgrade completed successfully on {{ inventory_hostname }} in Phase 1"
-          when: upgrade_status == "success"
-        
-        - name: Log Phase 1 timeout (RHEL)
-          ansible.builtin.debug:
-            msg: "Package upgrade timed out on {{ inventory_hostname }} in Phase 1 (5 min). Will retry in Phase 2."
-          when: upgrade_status == "timeout"
-      rescue:
-        - name: Mark as timeout on error (RHEL)
-          ansible.builtin.set_fact:
-            upgrade_status: "timeout"
-        - name: Log Phase 1 error (RHEL)
-          ansible.builtin.debug:
-            msg: "Package upgrade error on {{ inventory_hostname }} in Phase 1. Will retry in Phase 2."
-      when: ansible_os_family == "RedHat"
-      ignore_errors: yes
-    
-    # Fedora-based systems - Phase 1
-    - name: Update package manager cache (Fedora-based) - Phase 1
-      block:
-        - name: Update dnf cache with timeout
-          ansible.builtin.shell: |
-            timeout {{ cache_timeout }} dnf makecache
-          args:
-            executable: /bin/bash
-          register: dnf_cache_result
-          failed_when: false
-      rescue:
-        - name: Log cache update failure (Fedora)
-          ansible.builtin.debug:
-            msg: "Failed to update cache on {{ inventory_hostname }}. Continuing..."
-      when: ansible_distribution == "Fedora"
-      ignore_errors: yes
-    
-    - name: Upgrade packages (Fedora-based) - Phase 1 - Initial 5min attempt
-      block:
-        - name: Upgrade packages with 5-minute timeout
-          ansible.builtin.shell: |
-            timeout {{ package_timeout_initial }} dnf update -y
-          args:
-            executable: /bin/bash
-          register: dnf_upgrade_phase1
-          failed_when: false
-        
-        - name: Check if Phase 1 upgrade succeeded
-          ansible.builtin.set_fact:
-            upgrade_status: "{{ 'success' if dnf_upgrade_phase1.rc == 0 else 'timeout' }}"
-          when: dnf_upgrade_phase1.rc is defined
-        
-        - name: Log Phase 1 success (Fedora)
-          ansible.builtin.debug:
-            msg: "Package upgrade completed successfully on {{ inventory_hostname }} in Phase 1"
-          when: upgrade_status == "success"
-        
-        - name: Log Phase 1 timeout (Fedora)
-          ansible.builtin.debug:
-            msg: "Package upgrade timed out on {{ inventory_hostname }} in Phase 1 (5 min). Will retry in Phase 2."
-          when: upgrade_status == "timeout"
-      rescue:
-        - name: Mark as timeout on error (Fedora)
-          ansible.builtin.set_fact:
-            upgrade_status: "timeout"
-        - name: Log Phase 1 error (Fedora)
-          ansible.builtin.debug:
-            msg: "Package upgrade error on {{ inventory_hostname }} in Phase 1. Will retry in Phase 2."
-      when: ansible_distribution == "Fedora"
-      ignore_errors: yes
-    
-    # ============================================
-    # PHASE 2: Retry timed-out hosts with 30-minute timeout
-    # ============================================
-    
-    - name: Display Phase 2 start message
+    - name: Reject unsupported package-manager families
+      ansible.builtin.assert:
+        that:
+          - ansible_facts["os_family"] in ["Debian", "RedHat"]
+        fail_msg: >-
+          Unsupported OS family {{ ansible_facts["os_family"] }} on
+          {{ inventory_hostname }}; no package update was attempted.
+
+    - name: Update APT package index
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - --verbose
+          - --signal=TERM
+          - "--kill-after={{ timeout_kill_grace }}s"
+          - "{{ cache_timeout }}s"
+          - apt-get
+          - -q
+          - -o
+          - "Acquire::Retries={{ apt_download_retries }}"
+          - -o
+          - "Acquire::http::Timeout={{ apt_download_timeout }}"
+          - -o
+          - "Acquire::https::Timeout={{ apt_download_timeout }}"
+          - -o
+          - "DPkg::Lock::Timeout={{ apt_lock_timeout }}"
+          - update
+      environment: "{{ apt_environment }}"
+      async: "{{ cache_timeout + timeout_kill_grace + async_watchdog_margin }}"
+      poll: "{{ async_poll_interval }}"
+      register: apt_cache_result
+      changed_when: false
+      when: ansible_facts["os_family"] == "Debian"
+
+    - name: Repair an interrupted Debian package transaction
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - --verbose
+          - --signal=TERM
+          - "--kill-after={{ timeout_kill_grace }}s"
+          - "{{ repair_timeout }}s"
+          - apt-get
+          - -q
+          - -y
+          - --fix-broken
+          - -o
+          - "Acquire::Retries={{ apt_download_retries }}"
+          - -o
+          - "Acquire::http::Timeout={{ apt_download_timeout }}"
+          - -o
+          - "Acquire::https::Timeout={{ apt_download_timeout }}"
+          - -o
+          - "DPkg::Lock::Timeout={{ apt_lock_timeout }}"
+          - -o
+          - "Dpkg::Options::=--force-confdef"
+          - -o
+          - "Dpkg::Options::=--force-confold"
+          - install
+      environment: "{{ apt_environment }}"
+      async: "{{ repair_timeout + timeout_kill_grace + async_watchdog_margin }}"
+      poll: "{{ async_poll_interval }}"
+      register: apt_repair_result
+      changed_when: >-
+        '0 upgraded, 0 newly installed' not in
+        (apt_repair_result.stdout | default(''))
+      when: ansible_facts["os_family"] == "Debian"
+
+    - name: Upgrade Debian packages
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - --verbose
+          - --signal=TERM
+          - "--kill-after={{ timeout_kill_grace }}s"
+          - "{{ upgrade_timeout }}s"
+          - apt-get
+          - -q
+          - -y
+          - -o
+          - "Acquire::Retries={{ apt_download_retries }}"
+          - -o
+          - "Acquire::http::Timeout={{ apt_download_timeout }}"
+          - -o
+          - "Acquire::https::Timeout={{ apt_download_timeout }}"
+          - -o
+          - "DPkg::Lock::Timeout={{ apt_lock_timeout }}"
+          - -o
+          - "Dpkg::Options::=--force-confdef"
+          - -o
+          - "Dpkg::Options::=--force-confold"
+          - upgrade
+      environment: "{{ apt_environment }}"
+      async: "{{ upgrade_timeout + timeout_kill_grace + async_watchdog_margin }}"
+      poll: "{{ async_poll_interval }}"
+      register: apt_upgrade_result
+      changed_when: >-
+        '0 upgraded, 0 newly installed' not in
+        (apt_upgrade_result.stdout | default(''))
+      when: ansible_facts["os_family"] == "Debian"
+
+    - name: Remove unused Debian packages
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - --verbose
+          - --signal=TERM
+          - "--kill-after={{ timeout_kill_grace }}s"
+          - "{{ cleanup_timeout }}s"
+          - apt-get
+          - -q
+          - -y
+          - -o
+          - "DPkg::Lock::Timeout={{ apt_lock_timeout }}"
+          - -o
+          - "Dpkg::Options::=--force-confdef"
+          - -o
+          - "Dpkg::Options::=--force-confold"
+          - autoremove
+      environment: "{{ apt_environment }}"
+      async: "{{ cleanup_timeout + timeout_kill_grace + async_watchdog_margin }}"
+      poll: "{{ async_poll_interval }}"
+      register: apt_autoremove_result
+      changed_when: >-
+        '0 upgraded, 0 newly installed, 0 to remove' not in
+        (apt_autoremove_result.stdout | default(''))
+      when: ansible_facts["os_family"] == "Debian"
+
+    - name: Clean obsolete Debian package files
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - --verbose
+          - --signal=TERM
+          - "--kill-after={{ timeout_kill_grace }}s"
+          - "{{ cleanup_timeout }}s"
+          - apt-get
+          - -q
+          - -y
+          - -o
+          - "DPkg::Lock::Timeout={{ apt_lock_timeout }}"
+          - autoclean
+      environment: "{{ apt_environment }}"
+      async: "{{ cleanup_timeout + timeout_kill_grace + async_watchdog_margin }}"
+      poll: "{{ async_poll_interval }}"
+      register: apt_autoclean_result
+      changed_when: false
+      when: ansible_facts["os_family"] == "Debian"
+
+    - name: Refresh RPM package metadata
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - --verbose
+          - --signal=TERM
+          - "--kill-after={{ timeout_kill_grace }}s"
+          - "{{ cache_timeout }}s"
+          - "{{ rpm_package_manager }}"
+          - -y
+          - makecache
+      environment:
+        LC_ALL: C
+      async: "{{ cache_timeout + timeout_kill_grace + async_watchdog_margin }}"
+      poll: "{{ async_poll_interval }}"
+      register: rpm_cache_result
+      changed_when: false
+      when: ansible_facts["os_family"] == "RedHat"
+
+    - name: Upgrade RPM packages
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - --verbose
+          - --signal=TERM
+          - "--kill-after={{ timeout_kill_grace }}s"
+          - "{{ upgrade_timeout }}s"
+          - "{{ rpm_package_manager }}"
+          - -y
+          - "{{ rpm_upgrade_action }}"
+      environment:
+        LC_ALL: C
+      async: "{{ upgrade_timeout + timeout_kill_grace + async_watchdog_margin }}"
+      poll: "{{ async_poll_interval }}"
+      register: rpm_upgrade_result
+      changed_when: >-
+        'Nothing to do' not in (rpm_upgrade_result.stdout | default('')) and
+        'No packages marked for update' not in
+        (rpm_upgrade_result.stdout | default(''))
+      when: ansible_facts["os_family"] == "RedHat"
+
+    - name: Clean RPM package metadata
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - --verbose
+          - --signal=TERM
+          - "--kill-after={{ timeout_kill_grace }}s"
+          - "{{ cleanup_timeout }}s"
+          - "{{ rpm_package_manager }}"
+          - -y
+          - clean
+          - all
+      environment:
+        LC_ALL: C
+      async: "{{ cleanup_timeout + timeout_kill_grace + async_watchdog_margin }}"
+      poll: "{{ async_poll_interval }}"
+      register: rpm_clean_result
+      changed_when: false
+      when: ansible_facts["os_family"] == "RedHat"
+
+    - name: Report successful package maintenance
       ansible.builtin.debug:
-        msg: "Starting Phase 2: Retrying hosts that timed out in Phase 1"
-      run_once: true
-    
-    # Debian-based systems - Phase 2
-    - name: Upgrade packages (Debian-based) - Phase 2 - Retry with 30min timeout
-      block:
-        - name: Retry upgrade with 30-minute timeout
-          ansible.builtin.shell: |
-            timeout {{ package_timeout_retry }} apt-get upgrade -y -o Dpkg::Options::="--force-confold" && \
-            apt-get autoremove -y && \
-            apt-get autoclean -y
-          args:
-            executable: /bin/bash
-          register: apt_upgrade_phase2
-          failed_when: false
-        
-        - name: Update upgrade status after Phase 2
-          ansible.builtin.set_fact:
-            upgrade_status: "{{ 'success' if apt_upgrade_phase2.rc == 0 else 'failed' }}"
-          when: apt_upgrade_phase2.rc is defined
-        
-        - name: Log Phase 2 success (Debian)
-          ansible.builtin.debug:
-            msg: "Package upgrade completed successfully on {{ inventory_hostname }} in Phase 2"
-          when: upgrade_status == "success"
-        
-        - name: Log Phase 2 failure (Debian)
-          ansible.builtin.debug:
-            msg: "Package upgrade failed or timed out on {{ inventory_hostname }} in Phase 2 (30 min). Manual intervention required."
-          when: upgrade_status == "failed"
-      rescue:
-        - name: Mark as failed after Phase 2 error (Debian)
-          ansible.builtin.set_fact:
-            upgrade_status: "failed"
-        - name: Log Phase 2 error (Debian)
-          ansible.builtin.debug:
-            msg: "Package upgrade error on {{ inventory_hostname }} in Phase 2. Manual intervention required."
-      when: 
-        - ansible_os_family == "Debian"
-        - upgrade_status == "timeout"
-      ignore_errors: yes
-    
-    # RHEL-based systems - Phase 2
-    - name: Upgrade packages (RHEL-based) - Phase 2 - Retry with 30min timeout
-      block:
-        - name: Retry upgrade with 30-minute timeout
-          ansible.builtin.shell: |
-            timeout {{ package_timeout_retry }} yum update -y
-          args:
-            executable: /bin/bash
-          register: yum_upgrade_phase2
-          failed_when: false
-        
-        - name: Update upgrade status after Phase 2
-          ansible.builtin.set_fact:
-            upgrade_status: "{{ 'success' if yum_upgrade_phase2.rc == 0 else 'failed' }}"
-          when: yum_upgrade_phase2.rc is defined
-        
-        - name: Log Phase 2 success (RHEL)
-          ansible.builtin.debug:
-            msg: "Package upgrade completed successfully on {{ inventory_hostname }} in Phase 2"
-          when: upgrade_status == "success"
-        
-        - name: Log Phase 2 failure (RHEL)
-          ansible.builtin.debug:
-            msg: "Package upgrade failed or timed out on {{ inventory_hostname }} in Phase 2 (30 min). Manual intervention required."
-          when: upgrade_status == "failed"
-      rescue:
-        - name: Mark as failed after Phase 2 error (RHEL)
-          ansible.builtin.set_fact:
-            upgrade_status: "failed"
-        - name: Log Phase 2 error (RHEL)
-          ansible.builtin.debug:
-            msg: "Package upgrade error on {{ inventory_hostname }} in Phase 2. Manual intervention required."
-      when: 
-        - ansible_os_family == "RedHat"
-        - upgrade_status == "timeout"
-      ignore_errors: yes
-    
-    # Fedora-based systems - Phase 2
-    - name: Upgrade packages (Fedora-based) - Phase 2 - Retry with 30min timeout
-      block:
-        - name: Retry upgrade with 30-minute timeout
-          ansible.builtin.shell: |
-            timeout {{ package_timeout_retry }} dnf update -y
-          args:
-            executable: /bin/bash
-          register: dnf_upgrade_phase2
-          failed_when: false
-        
-        - name: Update upgrade status after Phase 2
-          ansible.builtin.set_fact:
-            upgrade_status: "{{ 'success' if dnf_upgrade_phase2.rc == 0 else 'failed' }}"
-          when: dnf_upgrade_phase2.rc is defined
-        
-        - name: Log Phase 2 success (Fedora)
-          ansible.builtin.debug:
-            msg: "Package upgrade completed successfully on {{ inventory_hostname }} in Phase 2"
-          when: upgrade_status == "success"
-        
-        - name: Log Phase 2 failure (Fedora)
-          ansible.builtin.debug:
-            msg: "Package upgrade failed or timed out on {{ inventory_hostname }} in Phase 2 (30 min). Manual intervention required."
-          when: upgrade_status == "failed"
-      rescue:
-        - name: Mark as failed after Phase 2 error (Fedora)
-          ansible.builtin.set_fact:
-            upgrade_status: "failed"
-        - name: Log Phase 2 error (Fedora)
-          ansible.builtin.debug:
-            msg: "Package upgrade error on {{ inventory_hostname }} in Phase 2. Manual intervention required."
-      when: 
-        - ansible_distribution == "Fedora"
-        - upgrade_status == "timeout"
-      ignore_errors: yes
-  
-  # Post-tasks: Clean up lock file (always runs, even on failure)
-  post_tasks:
-    - name: Display final summary
-      ansible.builtin.debug:
-        msg: "Host {{ inventory_hostname }} final status: {{ upgrade_status | default('unknown') }}"
-      failed_when: false
-    
-    - name: Remove lock file
+        msg: "Package maintenance completed successfully on {{ inventory_hostname }}."
+
+# This play runs after all serial batches and also runs when individual hosts
+# fail, so normal failures do not leave the controller locked until it is stale.
+- name: Release Linux updater lock
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+
+  vars:
+    updater_lock_path: /tmp/ansible-updater.lock
+
+  tasks:
+    - name: Release updater lock
       ansible.builtin.file:
-        path: "{{ lock_file_path }}"
+        path: "{{ updater_lock_path }}"
         state: absent
-      delegate_to: localhost
-      run_once: true
-      become: false  # Don't require sudo for localhost operations
-      failed_when: false
-    
-    - name: Display completion message
+
+    - name: Report updater completion
       ansible.builtin.debug:
-        msg: "Update playbook completed. Lock file cleaned up."
-      run_once: true
-      failed_when: false
-      become: false
+        msg: "Linux updater run finished and the controller lock was released."
